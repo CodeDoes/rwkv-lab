@@ -152,3 +152,75 @@ def test_blt_performance_benchmark():
     # Since the sequence length is small, CPU overhead might dominate, but the forward passes should both run correctly
     assert t_blt > 0
     assert t_std > 0
+
+
+def test_blt_entropy_learning_and_patch_adaptation():
+    """Verify that training the entropy head on a simple context-rich sequence
+    reduces predicted next-byte entropy and increases average patch lengths.
+    """
+    torch.manual_seed(42)
+    B, T, C = 2, 32, 16
+
+    # Create a highly predictable context-rich sequence (repeating pattern 'abcabc...')
+    pattern = [97, 98, 99]  # 'a', 'b', 'c'
+    seq = []
+    for _ in range(T):
+        seq.append(pattern[_ % len(pattern)])
+    train_data = torch.tensor([seq, seq], dtype=torch.long)  # [2, 32]
+
+    # Initialize a small BLT block/model with at least 2 layers
+    from rwkv_lab.toy_blt_train import BLTRWKV7LanguageModel
+    import torch.nn.functional as F
+    model = BLTRWKV7LanguageModel(
+        vocab_size=256,
+        d_model=C,
+        n_layers=2,
+        threshold=3.0,
+        max_patch=8
+    )
+
+    # 1. Evaluate untrained model
+    model.eval()
+    with torch.no_grad():
+        _ = model(train_data)
+        # Check starting patch IDs
+        init_patch_ids = model.blocks[0].ffn.last_patch_ids
+        init_num_patches = int(init_patch_ids[0].max()) + 1
+        init_avg_len = T / init_num_patches
+        init_entropy = model.blocks[0].ffn.last_entropy
+
+    # Untrained model must have high entropy and patch lengths close or equal to 1.0
+    assert init_entropy.mean().item() > 4.5
+    assert init_avg_len < 1.1, f"Expected initial average patch length close to 1.0, got {init_avg_len}"
+
+    # 2. Train the model for some steps
+    model.train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+
+    for step in range(30):
+        optimizer.zero_grad()
+        logits, entropy_losses = model(train_data, target_bytes=train_data)
+        ce_loss = F.cross_entropy(logits[:, :-1].reshape(-1, 256), train_data[:, 1:].reshape(-1))
+        entropy_loss = sum(entropy_losses)
+        total_loss = ce_loss + 0.5 * entropy_loss
+        total_loss.backward()
+        optimizer.step()
+
+    # 3. Evaluate trained model
+    model.eval()
+    with torch.no_grad():
+        _ = model(train_data)
+        trained_patch_ids = model.blocks[0].ffn.last_patch_ids
+        trained_num_patches = int(trained_patch_ids[0].max()) + 1
+        trained_avg_len = T / trained_num_patches
+        trained_entropy = model.blocks[0].ffn.last_entropy
+
+    # The trained model should have learned context-aware predictions, leading to
+    # lower next-byte entropy on predictable tokens and larger patch lengths (> 1.0)
+    print(f"\n--- Entropy Adaptation Proof ---")
+    print(f"Initial entropy: {init_entropy.mean().item():.3f} | Trained entropy: {trained_entropy.mean().item():.3f}")
+    print(f"Initial patch length: {init_avg_len:.3f} | Trained patch length: {trained_avg_len:.3f}")
+    print(f"--------------------------------")
+
+    assert trained_entropy.mean().item() < init_entropy.mean().item(), "Entropy should decrease after training"
+    assert trained_avg_len > 1.1, f"Average patch length should increase after training, got {trained_avg_len}"

@@ -58,6 +58,7 @@ class BLTRWKV7Block(nn.Module):
         shift_state_att: Optional[torch.Tensor] = None,
         shift_state_ffn: Optional[tuple] = None,
         return_state: bool = False,
+        target_bytes: Optional[torch.Tensor] = None,
     ):
         # 1. TimeMix
         ln_x = self.ln1(x)
@@ -85,6 +86,11 @@ class BLTRWKV7Block(nn.Module):
 
         if return_state:
             return x, v_first_out, (next_state_att, next_shift_att), next_state_ffn
+
+        if target_bytes is not None:
+            entropy_loss = self.ffn.compute_entropy_loss(ln_x2, target_bytes)
+            return x, v_first_out, entropy_loss
+
         return x, v_first_out
 
 
@@ -98,11 +104,12 @@ class BLTRWKV7LanguageModel(nn.Module):
         self.ln_out = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
 
-    def forward(self, ids: torch.Tensor, states: Optional[list] = None, return_state: bool = False):
+    def forward(self, ids: torch.Tensor, states: Optional[list] = None, return_state: bool = False, target_bytes: Optional[torch.Tensor] = None):
         x = self.emb(ids)
 
         v_first = None
         next_states = []
+        entropy_losses = []
         for i, block in enumerate(self.blocks):
             if return_state:
                 init_state_att = states[i][0][0] if states else None
@@ -115,13 +122,19 @@ class BLTRWKV7LanguageModel(nn.Module):
                 )
                 next_states.append((next_state_att, next_state_ffn))
             else:
-                x, v_first = block(x, v_first=v_first)
+                if target_bytes is not None:
+                    x, v_first, e_loss = block(x, v_first=v_first, target_bytes=target_bytes)
+                    entropy_losses.append(e_loss)
+                else:
+                    x, v_first = block(x, v_first=v_first)
 
         x = self.ln_out(x)
         logits = self.head(x)
 
         if return_state:
             return logits, next_states
+        if target_bytes is not None:
+            return logits, entropy_losses
         return logits
 
 
@@ -188,10 +201,10 @@ def main():
     # Hyperparameters
     d_model = 32
     n_layers = 2
-    threshold = 2.8
+    threshold = 3.5
     max_patch = 8
     lr = 3e-3
-    epochs = 40
+    epochs = 60
 
     # 1. Create dataset
     train_data, val_data = generate_multilingual_dataset()
@@ -217,8 +230,8 @@ def main():
         model.train()
         optimizer.zero_grad()
 
-        # Forward pass
-        logits = model(train_data) # [B, T, 256]
+        # Forward pass (context-aware next-byte prediction and entropy heads training)
+        logits, entropy_losses = model(train_data, target_bytes=train_data) # [B, T, 256]
 
         # 1. Standard next-byte prediction loss
         ce_loss = F.cross_entropy(
@@ -227,11 +240,7 @@ def main():
         )
 
         # 2. Entropy prediction head losses (to train the entropy predictors)
-        entropy_loss = 0.0
-        for block in model.blocks:
-            entropy_loss += block.ffn.compute_entropy_loss(
-                model.emb(train_data), train_data
-            )
+        entropy_loss = sum(entropy_losses)
 
         total_loss = ce_loss + 0.1 * entropy_loss
         total_loss.backward()
@@ -247,27 +256,19 @@ def main():
                     val_data[:, 1:].reshape(-1)
                 ).item()
 
-                # Calculate average patch length across layers
+                # Calculate average patch length across layers using stored context-aware last_patch_ids
                 avg_lens = []
                 for b_idx, block in enumerate(model.blocks):
-                    # Compute patch IDs for val data to see segmentation
-                    l_logits = block.ffn.entropy_head(model.emb(val_data))
-                    l_probs = F.softmax(l_logits, dim=-1)
-                    l_entropy = -(l_probs * torch.log(l_probs + 1e-9)).sum(dim=-1)
-
-                    from rwkv_lab.byte_patches import entropy_patch_ids
-                    patch_ids = entropy_patch_ids(
-                        l_entropy,
-                        threshold=block.ffn.threshold,
-                        min_patch=block.ffn.min_patch,
-                        max_patch=block.ffn.max_patch
-                    )
+                    patch_ids = block.ffn.last_patch_ids
                     num_patches = int(patch_ids[0].max()) + 1
                     avg_len = val_data.shape[1] / num_patches
                     avg_lens.append(avg_len)
 
                 lens_str = ", ".join([f"L{i}: {l:.2f}" for i, l in enumerate(avg_lens)])
                 print(f"Epoch {epoch:02d} | Train CE: {ce_loss.item():.4f} | Val CE: {val_ce:.4f} | Avg Patch Lens: [{lens_str}]")
+                for b_idx, block in enumerate(model.blocks):
+                    ent = block.ffn.last_entropy
+                    print(f"  L{b_idx} entropy: min={ent.min().item():.2f}, mean={ent.mean().item():.2f}, max={ent.max().item():.2f}")
 
     print("\nTraining completed successfully!")
 
