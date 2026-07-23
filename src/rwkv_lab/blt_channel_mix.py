@@ -115,6 +115,10 @@ class RWKV7BLTChannelMix(nn.Module):
                 max_patch=self.max_patch
             ) # [B, T]
 
+            # Store for downstream inspection/logging
+            self.last_entropy = entropy.detach()
+            self.last_patch_ids = patch_ids
+
             # 3. Dynamic Mean Pooling
             n = int(patch_ids.max()) + 1
             values = hidden_states.new_zeros(B, n, C)
