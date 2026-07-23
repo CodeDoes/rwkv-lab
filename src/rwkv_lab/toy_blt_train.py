@@ -202,7 +202,7 @@ def main():
     d_model = 32
     n_layers = 2
     threshold = 3.5
-    max_patch = 8
+    max_patch = 16
     lr = 3e-3
     epochs = 60
 
