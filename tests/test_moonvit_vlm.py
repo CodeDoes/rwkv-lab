@@ -534,7 +534,12 @@ def test_image_metadata_fingerprint_detects_replaced_training_input(tmp_path: Pa
     manifest = tmp_path / "rows.jsonl"
     manifest.write_text(json.dumps({"image": "x.jpg", "text": "caption"}) + "\n")
     before = image_metadata_fingerprint(load_examples(manifest, root=tmp_path))
-    Image.new("RGB", (8, 8)).save(image)
+    import time
+    time.sleep(0.01)
+    Image.new("RGB", (128, 128)).save(image)
+    # Force a size difference by appending extra bytes to the image file
+    with image.open("ab") as f:
+        f.write(b"additional_bytes_to_guarantee_size_and_mtime_difference")
     after = image_metadata_fingerprint(load_examples(manifest, root=tmp_path))
     assert before != after
 
