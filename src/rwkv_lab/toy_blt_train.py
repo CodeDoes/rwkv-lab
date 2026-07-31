@@ -21,7 +21,7 @@ from rwkv_lab.rwkv8_deltanet import RWKV8TimeMixDeltaNet
 
 # 1. Custom BLT-RWKV-7 Block and Model
 class BLTRWKV7Block(nn.Module):
-    def __init__(self, d_model: int, i: int, num_layers: int, threshold: float = 3.0, max_patch: int = 8):
+    def __init__(self, d_model: int, i: int, num_layers: int, threshold: float = 3.0, max_patch: int = 16):
         super().__init__()
         self.i = i
         self.ln1 = nn.LayerNorm(d_model)
@@ -95,7 +95,7 @@ class BLTRWKV7Block(nn.Module):
 
 
 class BLTRWKV7LanguageModel(nn.Module):
-    def __init__(self, vocab_size: int = 256, d_model: int = 64, n_layers: int = 2, threshold: float = 2.8, max_patch: int = 8):
+    def __init__(self, vocab_size: int = 256, d_model: int = 64, n_layers: int = 2, threshold: float = 2.8, max_patch: int = 16):
         super().__init__()
         self.emb = nn.Embedding(vocab_size, d_model)
         self.blocks = nn.ModuleList([
@@ -192,19 +192,31 @@ def generate_multilingual_dataset() -> tuple[torch.Tensor, torch.Tensor]:
     return torch.tensor(chunks, dtype=torch.long), torch.tensor([val_bytes], dtype=torch.long)
 
 
+import argparse
+
+
 # 3. Training Loop
 def main():
+    parser = argparse.ArgumentParser(description="Train a small multilingual BLT-RWKV-7 language model.")
+    parser.add_argument("--d_model", type=int, default=32, help="Hidden dimension of the model")
+    parser.add_argument("--n_layers", type=int, default=2, help="Number of layers in the model")
+    parser.add_argument("--threshold", type=float, default=3.5, help="Entropy threshold for patch boundary splits")
+    parser.add_argument("--max_patch", type=int, default=16, help="Maximum allowed patch size in bytes")
+    parser.add_argument("--lr", type=float, default=3e-3, help="Learning rate")
+    parser.add_argument("--epochs", type=int, default=60, help="Number of training epochs")
+    args = parser.parse_args()
+
     print("=====================================================================")
     print("        RWKV-7 + BLT ChannelMix Multilingual Toy Trainer            ")
     print("=====================================================================")
 
     # Hyperparameters
-    d_model = 32
-    n_layers = 2
-    threshold = 3.5
-    max_patch = 8
-    lr = 3e-3
-    epochs = 60
+    d_model = args.d_model
+    n_layers = args.n_layers
+    threshold = args.threshold
+    max_patch = args.max_patch
+    lr = args.lr
+    epochs = args.epochs
 
     # 1. Create dataset
     train_data, val_data = generate_multilingual_dataset()
