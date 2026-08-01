@@ -7,12 +7,14 @@ os.environ.setdefault("RWKV8_FORCE_PYREF", "1")
 
 import json
 from pathlib import Path
-import pytest
 import torch
 
 from rwkv_lab.blt_validation import (
     StandardRWKV7LanguageModel,
     run_comparative_validation,
+    parse_zip_chars,
+    zip_compress_bytes,
+    zip_decompress_bytes,
 )
 
 
@@ -43,8 +45,8 @@ def test_comparative_validation_pipeline():
     # Clean up existing report
     report_path.unlink(missing_ok=True)
 
-    # Run comparative validation for 5 epochs (to keep test suite fast)
-    report = run_comparative_validation(epochs=5, lr=3e-3, threshold=3.5, max_patch=16)
+    # Run comparative validation for 1 epoch (to keep test suite fast on CPU slow python wkv7 fallback)
+    report = run_comparative_validation(epochs=1, lr=3e-3, threshold=3.5, max_patch=16)
 
     # 1. Assert structure of return dictionary
     assert "parameters" in report
@@ -85,3 +87,46 @@ def test_comparative_validation_pipeline():
         saved_report = json.load(f)
 
     assert saved_report == report
+
+
+def test_parse_zip_chars():
+    """Verify that parse_zip_chars parses comma-separated strings to ascii integers correctly."""
+    chars_str = " ,#,=,-"
+    parsed = parse_zip_chars(chars_str)
+    # ord(' ') = 32, ord('#') = 35, ord('=') = 61, ord('-') = 45
+    assert parsed == {32, 35, 61, 45}
+
+
+def test_zip_compression_decompression_equivalence():
+    """Verify that compression and decompression are perfect exact mathematical inverses."""
+    original_bytes = [104, 101, 108, 108, 111, 32, 32, 32, 32, 32, 119, 111, 114, 108, 100, 61, 61, 61, 61, 10]
+    zip_chars = {32, 61} # spaces and equals
+
+    compressed = zip_compress_bytes(original_bytes, zip_chars, min_run=3, zip_token=256)
+
+    # Check that spaces [32, 32, 32, 32, 32] got compressed to [256, 32, 5]
+    # Check that equals [61, 61, 61, 61] got compressed to [256, 61, 4]
+    assert 256 in compressed
+    assert compressed == [104, 101, 108, 108, 111, 256, 32, 5, 119, 111, 114, 108, 100, 256, 61, 4, 10]
+
+    decompressed = zip_decompress_bytes(compressed, zip_token=256)
+    assert decompressed == original_bytes
+
+
+def test_comparative_validation_with_zip():
+    """Verify that comparative validation runs and outputs correct reports with zip compression enabled."""
+    report_path = Path("runs/blt_comparison_report.json")
+    report_path.unlink(missing_ok=True)
+
+    # Run comparative validation for 1 epoch to keep testing fast on CPU
+    report = run_comparative_validation(epochs=1, lr=3e-3, threshold=3.5, max_patch=16, zip_compress=True)
+
+    assert "parameters" in report
+    assert "training" in report
+    assert "benchmark" in report
+    assert "dynamic_adaptation" in report
+
+    # Verify that standard model has larger parameter counts because vocab size increased to 257
+    assert report["parameters"]["standard_rwkv7"] > 38144
+
+    assert report_path.is_file()

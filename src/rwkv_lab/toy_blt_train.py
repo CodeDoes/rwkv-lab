@@ -9,6 +9,7 @@ the model, showcasing training convergence, entropy-head learning, and patch-len
 from __future__ import annotations
 
 import random
+import argparse
 from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
@@ -192,7 +193,72 @@ def generate_multilingual_dataset() -> tuple[torch.Tensor, torch.Tensor]:
     return torch.tensor(chunks, dtype=torch.long), torch.tensor([val_bytes], dtype=torch.long)
 
 
-import argparse
+def parse_zip_chars(chars_str: str) -> set[int]:
+    """Parse comma-separated characters to a set of byte integers."""
+    res = set()
+    for segment in chars_str.split(","):
+        if not segment:
+            continue
+        for char in segment:
+            res.add(ord(char))
+    return res
+
+
+def zip_compress_bytes(byte_list: list[int], zip_chars: set[int], min_run: int = 3, zip_token: int = 256) -> list[int]:
+    """Compress repeating runs of specified characters in a byte list."""
+    compressed = []
+    i = 0
+    n = len(byte_list)
+    while i < n:
+        val = byte_list[i]
+        if val in zip_chars:
+            run_len = 1
+            while i + run_len < n and byte_list[i + run_len] == val:
+                run_len += 1
+            if run_len >= min_run:
+                while run_len > 0:
+                    current_run = min(run_len, 255)
+                    compressed.extend([zip_token, val, current_run])
+                    run_len -= current_run
+                i += run_len
+                continue
+        compressed.append(val)
+        i += 1
+    return compressed
+
+
+def zip_decompress_bytes(token_list: list[int], zip_token: int = 256) -> list[int]:
+    """Decompress a list of tokens back to raw bytes."""
+    decompressed = []
+    i = 0
+    n = len(token_list)
+    while i < n:
+        if token_list[i] == zip_token:
+            if i + 2 < n:
+                val = token_list[i + 1]
+                count = token_list[i + 2]
+                decompressed.extend([val] * count)
+                i += 3
+                continue
+        decompressed.append(token_list[i])
+        i += 1
+    return decompressed
+
+
+def compress_tensor_batch(data_tensor: torch.Tensor, zip_chars: set[int], min_run: int = 3, zip_token: int = 256) -> torch.Tensor:
+    """Compress a batch of byte rows into a padded tensor."""
+    compressed_rows = []
+    max_len = 0
+    for row in data_tensor:
+        comp = zip_compress_bytes(row.tolist(), zip_chars, min_run, zip_token)
+        compressed_rows.append(comp)
+        if len(comp) > max_len:
+            max_len = len(comp)
+    padded_rows = []
+    for comp in compressed_rows:
+        padded = comp + [0] * (max_len - len(comp))
+        padded_rows.append(padded)
+    return torch.tensor(padded_rows, dtype=torch.long)
 
 
 # 3. Training Loop
@@ -204,6 +270,9 @@ def main():
     parser.add_argument("--max_patch", type=int, default=16, help="Maximum allowed patch size in bytes")
     parser.add_argument("--lr", type=float, default=3e-3, help="Learning rate")
     parser.add_argument("--epochs", type=int, default=60, help="Number of training epochs")
+    parser.add_argument("--zip_compress", action="store_true", help="Enable zip compression for repeating bytes")
+    parser.add_argument("--zip_chars", type=str, default=" ,#,=,-", help="Comma-separated characters to zip compress")
+    parser.add_argument("--zip_min_run", type=int, default=3, help="Minimum repeating run length to zip compress")
     args = parser.parse_args()
 
     print("=====================================================================")
@@ -220,19 +289,27 @@ def main():
 
     # 1. Create dataset
     train_data, val_data = generate_multilingual_dataset()
+    vocab_size = 256
+    if args.zip_compress:
+        zip_chars = parse_zip_chars(args.zip_chars)
+        train_data = compress_tensor_batch(train_data, zip_chars, args.zip_min_run, 256)
+        val_data = compress_tensor_batch(val_data, zip_chars, args.zip_min_run, 256)
+        vocab_size = 257
+        print(f"Zip compression enabled on characters: {zip_chars}")
+
     print(f"Dataset generated:")
     print(f"  Training batch shape:   {train_data.shape}")
     print(f"  Validation batch shape: {val_data.shape}")
 
     # 2. Build model
     model = BLTRWKV7LanguageModel(
-        vocab_size=256,
+        vocab_size=vocab_size,
         d_model=d_model,
         n_layers=n_layers,
         threshold=threshold,
         max_patch=max_patch
     )
-    print(f"Model constructed with {n_layers} layers, threshold={threshold}, max_patch={max_patch}.")
+    print(f"Model constructed with {n_layers} layers, threshold={threshold}, max_patch={max_patch}, vocab_size={vocab_size}.")
 
     # Optimizer
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
@@ -243,11 +320,11 @@ def main():
         optimizer.zero_grad()
 
         # Forward pass (context-aware next-byte prediction and entropy heads training)
-        logits, entropy_losses = model(train_data, target_bytes=train_data) # [B, T, 256]
+        logits, entropy_losses = model(train_data, target_bytes=train_data)
 
         # 1. Standard next-byte prediction loss
         ce_loss = F.cross_entropy(
-            logits[:, :-1].reshape(-1, 256),
+            logits[:, :-1].reshape(-1, vocab_size),
             train_data[:, 1:].reshape(-1)
         )
 
@@ -264,7 +341,7 @@ def main():
             with torch.no_grad():
                 val_logits = model(val_data)
                 val_ce = F.cross_entropy(
-                    val_logits[:, :-1].reshape(-1, 256),
+                    val_logits[:, :-1].reshape(-1, vocab_size),
                     val_data[:, 1:].reshape(-1)
                 ).item()
 
@@ -297,6 +374,9 @@ def main():
 
     # Feed prompt to build states
     with torch.no_grad():
+        if args.zip_compress:
+            generated = zip_compress_bytes(generated, zip_chars, args.zip_min_run, 256)
+
         for byte in generated:
             input_tensor = torch.tensor([[byte]], dtype=torch.long)
             _, states = model(input_tensor, states=states, return_state=True)
@@ -314,12 +394,15 @@ def main():
             try:
                 char = bytes([next_byte]).decode("utf-8")
                 print(char, end="", flush=True)
-            except UnicodeDecodeError:
+            except (UnicodeDecodeError, ValueError):
                 print(".", end="", flush=True)
 
     # Print final decoded string
     print("\n\nFull Generated text (decoded):")
-    final_text = bytes(generated).decode("utf-8", errors="replace")
+    decoded_tokens = generated
+    if args.zip_compress:
+        decoded_tokens = zip_decompress_bytes(generated, 256)
+    final_text = bytes(decoded_tokens).decode("utf-8", errors="replace")
     print(f"'{final_text}'")
     print("--------------------------------------")
 

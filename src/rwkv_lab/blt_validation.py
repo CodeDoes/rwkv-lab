@@ -24,6 +24,74 @@ from rwkv_lab.rwkv8_deltanet import RWKV8TimeMixDeltaNet, RWKV8ChannelMixDeltaNe
 from rwkv_lab.toy_blt_train import BLTRWKV7LanguageModel, generate_multilingual_dataset
 
 
+def parse_zip_chars(chars_str: str) -> set[int]:
+    """Parse comma-separated characters to a set of byte integers."""
+    res = set()
+    for segment in chars_str.split(","):
+        if not segment:
+            continue
+        for char in segment:
+            res.add(ord(char))
+    return res
+
+
+def zip_compress_bytes(byte_list: list[int], zip_chars: set[int], min_run: int = 3, zip_token: int = 256) -> list[int]:
+    """Compress repeating runs of specified characters in a byte list."""
+    compressed = []
+    i = 0
+    n = len(byte_list)
+    while i < n:
+        val = byte_list[i]
+        if val in zip_chars:
+            run_len = 1
+            while i + run_len < n and byte_list[i + run_len] == val:
+                run_len += 1
+            if run_len >= min_run:
+                while run_len > 0:
+                    current_run = min(run_len, 255)
+                    compressed.extend([zip_token, val, current_run])
+                    run_len -= current_run
+                i += run_len
+                continue
+        compressed.append(val)
+        i += 1
+    return compressed
+
+
+def zip_decompress_bytes(token_list: list[int], zip_token: int = 256) -> list[int]:
+    """Decompress a list of tokens back to raw bytes."""
+    decompressed = []
+    i = 0
+    n = len(token_list)
+    while i < n:
+        if token_list[i] == zip_token:
+            if i + 2 < n:
+                val = token_list[i + 1]
+                count = token_list[i + 2]
+                decompressed.extend([val] * count)
+                i += 3
+                continue
+        decompressed.append(token_list[i])
+        i += 1
+    return decompressed
+
+
+def compress_tensor_batch(data_tensor: torch.Tensor, zip_chars: set[int], min_run: int = 3, zip_token: int = 256) -> torch.Tensor:
+    """Compress a batch of byte rows into a padded tensor."""
+    compressed_rows = []
+    max_len = 0
+    for row in data_tensor:
+        comp = zip_compress_bytes(row.tolist(), zip_chars, min_run, zip_token)
+        compressed_rows.append(comp)
+        if len(comp) > max_len:
+            max_len = len(comp)
+    padded_rows = []
+    for comp in compressed_rows:
+        padded = comp + [0] * (max_len - len(comp))
+        padded_rows.append(padded)
+    return torch.tensor(padded_rows, dtype=torch.long)
+
+
 class StandardRWKV7Block(nn.Module):
     """A standard RWKV-7 block running TimeMix and ChannelMix at the raw byte/character level."""
 
@@ -82,7 +150,15 @@ class StandardRWKV7LanguageModel(nn.Module):
         return self.head(x)
 
 
-def run_comparative_validation(epochs: int = 50, lr: float = 3e-3, threshold: float = 3.5, max_patch: int = 16):
+def run_comparative_validation(
+    epochs: int = 50,
+    lr: float = 3e-3,
+    threshold: float = 3.5,
+    max_patch: int = 16,
+    zip_compress: bool = False,
+    zip_chars_str: str = " ,#,=,-",
+    zip_min_run: int = 3
+):
     print("=====================================================================")
     print("      Comparative Validation: Standard RWKV-7 vs BLT-RWKV-7          ")
     print("=====================================================================")
@@ -92,6 +168,14 @@ def run_comparative_validation(epochs: int = 50, lr: float = 3e-3, threshold: fl
 
     # 1. Prepare Datasets (multilingual UTF-8 stories)
     train_data, val_data = generate_multilingual_dataset()
+    vocab_size = 256
+    if zip_compress:
+        zip_chars = parse_zip_chars(zip_chars_str)
+        train_data = compress_tensor_batch(train_data, zip_chars, zip_min_run, 256)
+        val_data = compress_tensor_batch(val_data, zip_chars, zip_min_run, 256)
+        vocab_size = 257
+        print(f"Zip compression enabled on characters: {zip_chars}")
+
     print(f"Dataset Details:")
     print(f"  Training batch shape:   {train_data.shape}")
     print(f"  Validation batch shape: {val_data.shape}")
@@ -100,9 +184,9 @@ def run_comparative_validation(epochs: int = 50, lr: float = 3e-3, threshold: fl
     d_model = 32
     n_layers = 2
 
-    std_model = StandardRWKV7LanguageModel(vocab_size=256, d_model=d_model, n_layers=n_layers).to(device)
+    std_model = StandardRWKV7LanguageModel(vocab_size=vocab_size, d_model=d_model, n_layers=n_layers).to(device)
     blt_model = BLTRWKV7LanguageModel(
-        vocab_size=256, d_model=d_model, n_layers=n_layers, threshold=threshold, max_patch=max_patch
+        vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, threshold=threshold, max_patch=max_patch
     ).to(device)
 
     # Count parameters
@@ -123,7 +207,7 @@ def run_comparative_validation(epochs: int = 50, lr: float = 3e-3, threshold: fl
         std_model.train()
         std_optimizer.zero_grad()
         logits = std_model(train_data)
-        loss = F.cross_entropy(logits[:, :-1].reshape(-1, 256), train_data[:, 1:].reshape(-1))
+        loss = F.cross_entropy(logits[:, :-1].reshape(-1, vocab_size), train_data[:, 1:].reshape(-1))
         loss.backward()
         std_optimizer.step()
         std_train_losses.append(loss.item())
@@ -131,7 +215,7 @@ def run_comparative_validation(epochs: int = 50, lr: float = 3e-3, threshold: fl
     std_model.eval()
     with torch.no_grad():
         std_val_logits = std_model(val_data)
-        std_val_loss = F.cross_entropy(std_val_logits[:, :-1].reshape(-1, 256), val_data[:, 1:].reshape(-1)).item()
+        std_val_loss = F.cross_entropy(std_val_logits[:, :-1].reshape(-1, vocab_size), val_data[:, 1:].reshape(-1)).item()
     print(f"Standard Model training complete. Final Train Loss: {std_train_losses[-1]:.4f} | Val Loss: {std_val_loss:.4f}")
 
     # 4. Train BLT-RWKV-7
@@ -145,7 +229,7 @@ def run_comparative_validation(epochs: int = 50, lr: float = 3e-3, threshold: fl
         blt_model.train()
         blt_optimizer.zero_grad()
         logits, entropy_losses = blt_model(train_data, target_bytes=train_data)
-        ce_loss = F.cross_entropy(logits[:, :-1].reshape(-1, 256), train_data[:, 1:].reshape(-1))
+        ce_loss = F.cross_entropy(logits[:, :-1].reshape(-1, vocab_size), train_data[:, 1:].reshape(-1))
         loss = ce_loss + 0.1 * sum(entropy_losses)
         loss.backward()
         blt_optimizer.step()
@@ -172,14 +256,14 @@ def run_comparative_validation(epochs: int = 50, lr: float = 3e-3, threshold: fl
     blt_model.eval()
     with torch.no_grad():
         blt_val_logits = blt_model(val_data)
-        blt_val_loss = F.cross_entropy(blt_val_logits[:, :-1].reshape(-1, 256), val_data[:, 1:].reshape(-1)).item()
+        blt_val_loss = F.cross_entropy(blt_val_logits[:, :-1].reshape(-1, vocab_size), val_data[:, 1:].reshape(-1)).item()
     print(f"BLT Model training complete. Final Train Loss: {blt_train_losses[-1]:.4f} | Val Loss: {blt_val_loss:.4f}")
 
     # 5. Throughput/Latency Benchmark on CPU
     print("\n--- Latency and Throughput Benchmarking ---")
     # Simulate a longer context sequence to highlight theoretical FFN performance scaling
     B, T = 4, 256
-    benchmark_input = torch.randint(0, 256, (B, T)).to(device)
+    benchmark_input = torch.randint(0, vocab_size, (B, T)).to(device)
 
     # Warmup
     for _ in range(3):
@@ -273,11 +357,17 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=3e-3, help="Learning rate")
     parser.add_argument("--threshold", type=float, default=3.5, help="Entropy threshold for patch boundary splits")
     parser.add_argument("--max_patch", type=int, default=16, help="Maximum allowed patch size in bytes")
+    parser.add_argument("--zip_compress", action="store_true", help="Enable zip compression for repeating bytes")
+    parser.add_argument("--zip_chars", type=str, default=" ,#,=,-", help="Comma-separated characters to zip compress")
+    parser.add_argument("--zip_min_run", type=int, default=3, help="Minimum repeating run length to zip compress")
     args = parser.parse_args()
 
     run_comparative_validation(
         epochs=args.epochs,
         lr=args.lr,
         threshold=args.threshold,
-        max_patch=args.max_patch
+        max_patch=args.max_patch,
+        zip_compress=args.zip_compress,
+        zip_chars_str=args.zip_chars,
+        zip_min_run=args.zip_min_run
     )
