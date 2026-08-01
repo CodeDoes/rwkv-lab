@@ -176,7 +176,7 @@ def test_blt_entropy_learning_and_patch_adaptation():
         d_model=C,
         n_layers=2,
         threshold=3.0,
-        max_patch=8
+        max_patch=16
     )
 
     # 1. Evaluate untrained model
